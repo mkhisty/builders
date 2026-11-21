@@ -11,3 +11,6 @@ starter-*/
 .agents/
 .aws/
 .codex/
+pipeline/preprocess
+pipeline/aggregate
+pipeline/aggregate.so

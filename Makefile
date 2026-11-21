@@ -8,9 +8,20 @@ FIXTURES ?= fixtures
 ANSWER ?= dev-answer
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev setup validate
+.PHONY: build fixtures dev run-dev check-dev setup validate native
 
-setup:
+CXX ?= g++
+native: pipeline/aggregate pipeline/aggregate.so
+
+pipeline/aggregate: pipeline/aggregate.cpp pipeline/csv.hpp pipeline/aggregate.hpp
+	$(CXX) -std=c++17 -O3 -pthread -Wall -Wextra -Werror $< -o $@
+
+pipeline/aggregate: pipeline/arrow_c_abi.h
+
+pipeline/aggregate.so: pipeline/aggregate.cpp pipeline/engine.cpp pipeline/aggregate.hpp pipeline/input.hpp pipeline/csv.hpp pipeline/arrow_c_abi.h
+	$(CXX) -std=c++17 -O3 -pthread -Wall -Wextra -Werror -DAGGREGATE_LIBRARY -fPIC -shared pipeline/aggregate.cpp pipeline/engine.cpp -o $@
+
+setup: native
 	python3 -m venv .venv
 	.venv/bin/pip install -r requirements-dev.txt
 

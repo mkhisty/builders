@@ -1,17 +1,23 @@
-# Shopping Sessions: DuckDB starter
+# Shopping Sessions: native pipeline
 
-From this repository root, run `make setup` once (Python venv, Docker with buildx, and Rust 1.85+ required). Then use `make fixtures`, `make dev`, `make run-dev`, and `make check-dev`. `make validate` runs all four in order and stops at the first failure. The pipeline implements strict parsing, linked identities, sessions, attribution, and assists.
+From this repository root, run `make setup` once (Python venv, a C++17 compiler, Docker with buildx, and Rust 1.85+ required). Then use `make fixtures`, `make dev`, `make run-dev`, and `make check-dev`. `make validate` runs all four in order and stops at the first failure. The pipeline implements strict parsing, linked identities, sessions, attribution, and assists.
+
+`pipeline/engine.cpp` memory-maps event and click inputs and schedules LF-aligned chunks across `NCPU` workers. Parsed rows stay in native memory. Hash tables deduplicate full event and click IDs, preserving invalid earliest event copies. Linked IDs are resolved before survivors are routed into person shards. Shards assign dense person IDs, sort 24-byte records, and call the shared session aggregator. No cleaned-event CSV, deduplication scratch files, or person-partition files are written.
+
+Completed people’s daily results and worker campaign totals are buffered into aggregate CSV files in `/scratch`. Python uses Arrow to write user Parquet parts and sum the campaign totals. DuckDB is no longer a runtime dependency. Campaign/category codes retain original names for output and byte-wise category tie breaks. Docker builds `aggregate.so`; `pipeline/native.py` calls it with the GIL released. `make native` builds the shared library and the standalone aggregation regression tool. Native timings include peak RSS.
+
+Attribution uses a rolling seven-day click queue, the latest winning click, and active click counts per campaign. Session starts snapshot the distinct assisting campaigns. Native stage times and attribution time are logged to stderr. Run `make native && .venv/bin/python scripts/check_attribution.py` to compare rolling attribution with exhaustive click lookups.
 
 For submission, push this repository to a public GitHub repository and provide its commit SHA to the platform. The platform builds the root Dockerfile and runs its default command. Keep generated data, output, and the virtual environment untracked; `.gitignore` excludes them. Run `make validate` successfully before submitting a solution.
 
-This repository contains a correctness-first DuckDB pipeline and the supplied fixture and dev-data checkers.
+This repository contains a native C++ pipeline and the supplied fixture and dev-data checkers.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
 ## What to do first
 
 - Read `rules.md` for the full rules.
-- Write your pipeline in `pipeline/pipeline.py`. The TODO lists the steps in order.
+- The pipeline entry point is `pipeline/pipeline.py`; native ingestion is in `pipeline/engine.cpp`.
 - Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
 
 ## Run and test locally
@@ -25,7 +31,7 @@ make build        # docker buildx build --platform linux/amd64 --load -t shoppin
 make fixtures     # runs the image on all 36 fixtures with scorer flags, diffs each against expected/
 ```
 
-Build, run, and check the 1M-event dev set. `make dev` needs `generate` on your PATH: build it from the track page's generator.zip (Rust 1.85 or newer; its README has the two commands).
+Build, run, and check the 1M-event dev set. `make dev` builds the included generator source (Rust 1.85 or newer).
 
 ```sh
 make dev                                # generate --seed 1 --events 1000000 --clicks 250000 --output dev
@@ -41,8 +47,8 @@ If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make
 To iterate without Docker:
 
 ```sh
-pip install duckdb==1.5.6
-python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+make setup
+SCRATCH_DIR=/tmp .venv/bin/python scripts/run_fixtures.py fixtures -- .venv/bin/python pipeline/pipeline.py
 ```
 
 ## Submitting and scoring
@@ -67,9 +73,9 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Common pitfalls
 
-- **DuckDB's CSV reader differs from `rules.md`.** It reads a quoted empty field `""` as an empty string, not null. Its malformed-line handling, including `ignore_errors`, `strict_mode`, and `null_padding`, does not match `rules.md`. Test against the fixtures before relying on it.
-- **Memory.** `pipeline.py` sets `memory_limit` to 80% of `MEM_GB` and `temp_directory` under `/scratch`, so big joins and sorts spill to disk instead of getting the container killed.
-- **No extension downloads.** The container has no network at run time. Parquet and CSV are built into the wheel; anything else must be installed at build time.
+- **Memory.** Native records and mapped input bytes remain available through aggregation. The implementation uses memory rather than ingestion spills. Validate new dataset sizes against the 24-GB container limit.
+- **CSV parsing.** Native parsing preserves spaces and CR, accepts only whole-field quoting, and splits records only at LF.
+- **No extension downloads.** The container has no network at run time. PyArrow is installed at build time.
 - **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
 - **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
 
@@ -83,5 +89,5 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 - `pipeline/pipeline.py` holds your pipeline code.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
-- `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
+- `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables.
 - `scripts/` runs your image the way the scorer does and diffs the output.
