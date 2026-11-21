@@ -1,0 +1,8 @@
+.venv/
+dev/
+out/
+generator/target/
+__pycache__/
+*.pyc
+starter-*/
+*.zip

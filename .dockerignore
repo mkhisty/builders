@@ -1,0 +1,13 @@
+fixtures/
+dev/
+out/
+generator/
+dev-answer/
+starter-*/
+*.zip
+*.md
+.git
+.venv/
+.agents/
+.aws/
+.codex/
