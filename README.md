@@ -1,10 +1,10 @@
 # Shopping Sessions: DuckDB starter
 
-From this repository root, run `make setup` once (Python venv, Docker with buildx, and Rust 1.85+ required). Then use `make fixtures`, `make dev`, `make run-dev`, and `make check-dev`. `make validate` runs all four in order and stops at the first failure. The supplied pipeline writes empty tables, so correctness checks will fail until it is implemented.
+From this repository root, run `make setup` once (Python venv, Docker with buildx, and Rust 1.85+ required). Then use `make fixtures`, `make dev`, `make run-dev`, and `make check-dev`. `make validate` runs all four in order and stops at the first failure. The pipeline implements strict parsing, linked identities, sessions, attribution, and assists.
 
 For submission, push this repository to a public GitHub repository and provide its commit SHA to the platform. The platform builds the root Dockerfile and runs its default command. Keep generated data, output, and the virtual environment untracked; `.gitignore` excludes them. Run `make validate` successfully before submitting a solution.
 
-This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with DuckDB, runs inside the scorer's container limits, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.
+This repository contains a correctness-first DuckDB pipeline and the supplied fixture and dev-data checkers.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
 
