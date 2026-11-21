@@ -5,8 +5,10 @@
 #include <sys/resource.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <deque>
 
 namespace {
 constexpr std::uint32_t CLICK = 1u << 31;
@@ -59,29 +61,6 @@ struct Parsed {
     i64 ingest = 0, ts = 0;
     std::uint32_t code = 0, revenue = 0;
 };
-// A leading sentinel preserves length and leading zeroes. Other IDs use full byte equality.
-std::uint64_t encode_id(std::string_view id) {
-    if (id.empty() || id.size() > 11) return 0;
-    std::uint64_t value = 1;
-    for (unsigned char c : id) {
-        unsigned digit;
-        if (c >= '0' && c <= '9') digit = c - '0' + 1;
-        else if (c >= 'a' && c <= 'z') digit = c - 'a' + 11;
-        else return 0;
-        value = value * 37 + digit;
-    }
-    return value;
-}
-
-std::uint64_t id_hash(std::string_view id, std::uint64_t encoded) {
-    if (!encoded) return std::hash<std::string_view>{}(id);
-    encoded ^= encoded >> 30;
-    encoded *= 0xbf58476d1ce4e5b9ULL;
-    encoded ^= encoded >> 27;
-    encoded *= 0x94d049bb133111ebULL;
-    return encoded ^ (encoded >> 31);
-}
-
 size_t table_capacity(size_t count) {
     size_t capacity = 16;
     while (count > capacity / 2) {
@@ -95,12 +74,6 @@ size_t table_capacity(size_t count) {
 struct WinnerSlot {
     std::uint64_t encoded = 0;
     Parsed* row = nullptr;
-};
-
-// Indices are one-based so zero marks an unused slot.
-struct PersonSlot {
-    std::uint64_t encoded = 0;
-    std::uint32_t index = 0;
 };
 
 // This hash reverses the seed-independent suffix of the generator's ID permutation.
@@ -125,11 +98,60 @@ size_t event_slot(std::string_view id, size_t mask) {
     return (value ^ (value >> 17) ^ (value >> 34)) & mask;
 }
 
+// Short IDs use less than 62 bits. The other two classes carry a linked
+// component number or an index into a producer's exact fallback strings.
+constexpr std::uint64_t LINKED = 1ULL << 63;
+constexpr std::uint64_t FALLBACK = 1ULL << 62;
+static_assert(2ULL * 37 * 37 * 37 * 37 * 37 * 37 * 37 * 37 * 37 * 37 * 37 < FALLBACK);
+
 struct Routed {
-    std::string_view user, click_id;
+    std::uint64_t identity;
     i64 ts;
-    std::uint32_t code, revenue;
+    std::uint32_t code, payload; // purchase cents or index into this producer's click IDs
 };
+static_assert(sizeof(Routed) == 24);
+
+struct Producer {
+    std::vector<std::vector<Routed>> shards;
+    std::vector<std::string_view> click_ids, fallback_ids;
+};
+
+void route(const Parsed& row, const Ids& ids, Producer& producer) {
+    const auto encoded = encode_id(row.user);
+    const auto linked = ids.linked_person(row.user, encoded);
+    std::uint64_t key = encoded;
+    size_t owner;
+    if (linked != Ids::absent) {
+        key = LINKED | linked;
+        owner = linked % producer.shards.size();
+    } else {
+        owner = id_hash(row.user, encoded) % producer.shards.size();
+        if (!encoded) {
+            key = FALLBACK | producer.fallback_ids.size();
+            producer.fallback_ids.push_back(row.user);
+        }
+    }
+    auto payload = row.revenue;
+    if (row.code & CLICK) {
+        if (producer.click_ids.size() >= UINT32_MAX) throw std::runtime_error("Too many clicks per producer");
+        payload = static_cast<std::uint32_t>(producer.click_ids.size());
+        producer.click_ids.push_back(row.id);
+    }
+    producer.shards[owner].push_back({key, row.ts, row.code, payload});
+}
+
+// Reconstruct an unlinked short ID just once per person, including leading zeroes.
+std::string decode_id(std::uint64_t key) {
+    constexpr char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char buffer[11];
+    char* end = buffer + sizeof(buffer);
+    char* it = end;
+    while (key != 1) {
+        *--it = alphabet[key % 37 - 1];
+        key /= 37;
+    }
+    return std::string(it, end);
+}
 
 struct CompactRow {
     i64 ts;
@@ -143,7 +165,11 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
     for (const auto& path : files(data / "links")) read(path, 2, [&](auto& f) {
         if (!f[0].empty() && !f[1].empty()) ids.join(f[0], f[1]);
     });
+    const auto links_read = std::chrono::steady_clock::now();
     ids.prepare();
+    const auto links_frozen = std::chrono::steady_clock::now();
+    std::cerr << "Link ingest: " << std::chrono::duration<double>(links_read - began).count() << " seconds\n";
+    std::cerr << "Link freeze: " << std::chrono::duration<double>(links_frozen - links_read).count() << " seconds\n";
     std::vector<std::string> names{"organic", "unknown"};
     std::unordered_map<std::string, std::uint32_t> codes{{"organic", 0}, {"unknown", 1}};
     auto intern = [&](std::string_view name) {
@@ -186,6 +212,7 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
         }
     }
     const size_t shard_count = size_t(workers) * 4;
+    const auto bitmap_begin = std::chrono::steady_clock::now();
     size_t event_bytes = 0;
     for (const auto& chunk : chunks) if (!chunk.click) event_bytes += chunk.end - chunk.begin;
     const size_t slot_count = size_t(1) << (event_bytes > 3ULL * 1024 * 1024 * 1024 ? 26 : 25);
@@ -225,11 +252,12 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
     seen.clear();
     repeated.clear();
     const auto scanned_at = std::chrono::steady_clock::now();
-    std::cerr << "Native ID scan: " << std::chrono::duration<double>(scanned_at - began).count() << " seconds\n";
+    std::cerr << "Native ID scan: " << std::chrono::duration<double>(scanned_at - bitmap_begin).count() << " seconds\n";
     std::vector<std::vector<std::vector<Parsed>>> parsed(workers,
         std::vector<std::vector<Parsed>>(shard_count));
-    std::vector<std::vector<std::vector<Routed>>> direct(workers,
-        std::vector<std::vector<Routed>>(shard_count));
+    // Parser workers and dedup tasks each write to a private producer.
+    std::vector<Producer> producers(workers + shard_count);
+    for (auto& producer : producers) producer.shards.resize(shard_count);
     parallel(chunks.size(), workers, [&](size_t task, size_t worker) {
         const auto& chunk = chunks[task];
         std::vector<std::string_view> f;
@@ -274,10 +302,7 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
             const bool unique = slot < slot_count && !(duplicates[slot / 64] & (1ULL << (slot % 64)));
             if (chunk.click || unique) {
                 if (row.user.empty()) continue;
-                row.user = ids.person(row.user);
-                const size_t shard = std::hash<std::string_view>{}(row.user) % shard_count;
-                direct[worker][shard].push_back({row.user, chunk.click ? row.id : std::string_view{},
-                                               row.ts, row.code, row.revenue});
+                route(row, ids, producers[worker]);
             } else {
                 const size_t shard = std::hash<std::string_view>{}(row.id) % shard_count;
                 parsed[worker][shard].push_back(row);
@@ -287,8 +312,6 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
     const auto parsed_at = std::chrono::steady_clock::now();
     std::cerr << "Native chunk parsing: " << std::chrono::duration<double>(parsed_at - scanned_at).count() << " seconds\n";
 
-    std::vector<std::vector<std::vector<Parsed*>>> buckets(shard_count,
-        std::vector<std::vector<Parsed*>>(shard_count));
     parallel(shard_count, workers, [&](size_t shard, size_t) {
         size_t count = 0;
         for (const auto& worker : parsed) count += worker[shard].size();
@@ -312,63 +335,70 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
             auto* row = winner.row;
             if (!row) continue;
             if (row->user.empty()) continue;
-            row->user = ids.person(row->user);
-            const size_t person_shard = std::hash<std::string_view>{}(row->user) % shard_count;
-            buckets[shard][person_shard].push_back(row);
+            route(*row, ids, producers[workers + shard]);
         }
     });
     const auto deduped_at = std::chrono::steady_clock::now();
     std::cerr << "Native deduplication and person partitioning: " << std::chrono::duration<double>(deduped_at - parsed_at).count() << " seconds\n";
 
+    if (std::getenv("SHOPPING_ID_STATS")) {
+        size_t linked = 0, numeric = 0, fallback = 0;
+        for (const auto& producer : producers)
+            for (const auto& shard : producer.shards)
+                for (const auto& row : shard) {
+                    if (row.identity & LINKED) ++linked;
+                    else if (row.identity & FALLBACK) ++fallback;
+                    else ++numeric;
+                }
+        std::cerr << "Routed rows: linked=" << linked << " unlinked_numeric=" << numeric
+                  << " unlinked_fallback=" << fallback << '\n';
+    }
     parallel(shard_count, workers, [&](size_t shard, size_t) {
         size_t count = 0;
-        for (const auto& source : buckets) count += source[shard].size();
-        for (const auto& source : direct) count += source[shard].size();
-        std::vector<std::string_view> persons, click_ids;
-        std::vector<PersonSlot> person_codes(table_capacity(count / 20 + 1));
-        auto insert_person = [&](std::string_view name) {
-            const auto encoded = encode_id(name);
-            size_t slot = id_hash(name, encoded) & (person_codes.size() - 1);
-            while (person_codes[slot].index &&
-                   (person_codes[slot].encoded != encoded ||
-                    (!encoded && persons[person_codes[slot].index - 1] != name))) {
-                slot = (slot + 1) & (person_codes.size() - 1);
-            }
-            return slot;
-        };
+        for (const auto& producer : producers) count += producer.shards[shard].size();
+        const size_t nlinked = ids.person_count();
+        const size_t linked_here = shard < nlinked ? 1 + (nlinked - shard - 1) / shard_count : 0;
+        std::vector<std::string_view> persons;
+        persons.reserve(linked_here + count / 30);
+        for (size_t i = shard; i < nlinked; i += shard_count)
+            persons.push_back(ids.canonical_name(static_cast<std::uint32_t>(i)));
+        std::unordered_map<std::uint64_t, std::uint32_t> numeric_people;
+        std::unordered_map<std::string_view, std::uint32_t> other_people;
+        std::deque<std::string> decoded_names;
+        std::vector<std::string_view> click_ids;
         std::vector<CompactRow> rows;
         rows.reserve(count);
-        auto append = [&](const Routed& row) {
-            if (persons.size() >= std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("Too many people in a shard");
-            if (persons.size() + 1 > person_codes.size() / 2) {
-                person_codes.assign(table_capacity(persons.size() + 1), PersonSlot{});
-                for (size_t i = 0; i < persons.size(); ++i) {
-                    const auto slot = insert_person(persons[i]);
-                    person_codes[slot] = {encode_id(persons[i]), std::uint32_t(i + 1)};
+        for (auto& producer : producers) {
+            for (const auto& row : producer.shards[shard]) {
+                std::uint32_t person;
+                if (row.identity & LINKED) {
+                    person = static_cast<std::uint32_t>((row.identity ^ LINKED) / shard_count);
+                } else {
+                    if (persons.size() >= UINT32_MAX) throw std::runtime_error("Too many people in a shard");
+                    if (row.identity & FALLBACK) {
+                        auto name = producer.fallback_ids[row.identity ^ FALLBACK];
+                        auto [it, added] = other_people.try_emplace(name, persons.size());
+                        if (added) persons.push_back(name);
+                        person = it->second;
+                    } else {
+                        auto [it, added] = numeric_people.try_emplace(row.identity, persons.size());
+                        if (added) {
+                            decoded_names.push_back(decode_id(row.identity));
+                            persons.push_back(decoded_names.back());
+                        }
+                        person = it->second;
+                    }
                 }
+                std::uint32_t click = 0, revenue = row.payload;
+                if (row.code & CLICK) {
+                    if (click_ids.size() >= UINT32_MAX) throw std::runtime_error("Too many clicks in a shard");
+                    click_ids.push_back(producer.click_ids[row.payload]);
+                    click = static_cast<std::uint32_t>(click_ids.size());
+                    revenue = 0;
+                }
+                rows.push_back({row.ts, person, row.code & ~CLICK, revenue, click});
             }
-            const auto slot = insert_person(row.user);
-            if (!person_codes[slot].index) {
-                persons.push_back(row.user);
-                person_codes[slot] = {encode_id(row.user), std::uint32_t(persons.size())};
-            }
-            const auto person = person_codes[slot].index - 1;
-            std::uint32_t click = 0;
-            if (row.code & CLICK) {
-                if (click_ids.size() >= std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("Too many clicks in a shard");
-                click_ids.push_back(row.click_id);
-                click = click_ids.size();
-            }
-            rows.push_back({row.ts, person, row.code & ~CLICK, row.revenue, click});
-        };
-        for (auto& source : direct) {
-            for (const auto& row : source[shard]) append(row);
-            std::vector<Routed>().swap(source[shard]);
-        }
-        for (auto& source : buckets) {
-            for (const auto* row : source[shard])
-                append({row->user, {}, row->ts, row->code, row->revenue});
-            std::vector<Parsed*>().swap(source[shard]);
+            std::vector<Routed>().swap(producer.shards[shard]);
         }
         // Counting scatter groups people in linear time. Only each person's times are sorted.
         std::vector<size_t> offsets(persons.size() + 1);
@@ -394,7 +424,7 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
             if (cursor == rows.size()) return false;
             const auto& input = rows[cursor++];
             row = {persons[input.person], input.click ? click_ids[input.click - 1] : std::string_view{},
-                   input.ts, input.revenue, input.click ? 1 : 2, std::int32_t(input.code)};
+                   input.ts, input.revenue, input.click ? 1 : 2, std::int32_t(input.code), input.person};
             return true;
         }, names, 0, channels, work);
     });

@@ -79,54 +79,128 @@ bool timestamp(std::string_view s, i64& value) {
     return true;
 }
 
-struct Ids {
-    std::unordered_map<std::string, size_t> index;
-    std::vector<size_t> parent, rank, smallest;
-    std::vector<std::string> names;
-    size_t add(std::string_view name) {
-        auto [it, added] = index.emplace(std::string(name), names.size());
-        if (added) {
-            parent.push_back(names.size());
-            smallest.push_back(names.size());
-            rank.push_back(0);
-            names.emplace_back(name);
-        }
-        return it->second;
+inline std::uint64_t encode_id(std::string_view id) {
+    if (id.empty() || id.size() > 11) return 0;
+    std::uint64_t value = 1;
+    for (unsigned char c : id) {
+        unsigned digit;
+        if (c >= '0' && c <= '9') digit = c - '0' + 1;
+        else if (c >= 'a' && c <= 'z') digit = c - 'a' + 11;
+        else return 0;
+        value = value * 37 + digit;
     }
-    size_t root(size_t x) {
-        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
-        return x;
-    }
+    return value;
+}
+
+inline std::uint64_t id_hash(std::string_view id, std::uint64_t encoded) {
+    if (!encoded) return std::hash<std::string_view>{}(id);
+    encoded ^= encoded >> 30;
+    encoded *= 0xbf58476d1ce4e5b9ULL;
+    encoded ^= encoded >> 27;
+    encoded *= 0x94d049bb133111ebULL;
+    return encoded ^ (encoded >> 31);
+}
+
+// During link ingestion each slot holds a union-find node. prepare() replaces it
+// with the final person number so event lookups use the same table in place.
+class Ids {
+public:
+    static constexpr std::uint32_t absent = std::numeric_limits<std::uint32_t>::max();
+
     void join(std::string_view a, std::string_view b) {
-        size_t x = add(a), y = add(b);
-        x = root(x); y = root(y);
+        auto x = root(add(a));
+        auto y = root(add(b));
         if (x == y) return;
         if (rank[x] < rank[y]) std::swap(x, y);
         parent[y] = x;
         if (rank[x] == rank[y]) ++rank[x];
         if (names[smallest[y]] < names[smallest[x]]) smallest[x] = smallest[y];
     }
-    void flatten() {
-        std::vector<size_t> canonical(parent.size());
-        for (size_t i = 0; i < parent.size(); ++i) canonical[i] = smallest[root(i)];
-        parent = std::move(canonical);
-    }
-    std::string_view person(std::string_view id) const {
-        // Transparent lookup avoids allocating a string on every event.
-        auto it = lookup.find(id);
-        return it == lookup.end() ? id : std::string_view(names[it->second]);
-    }
-    std::unordered_map<std::string_view, size_t> lookup;
+
     void prepare() {
-        flatten();
-        lookup.reserve(names.size());
-        for (size_t i = 0; i < names.size(); ++i) lookup.emplace(names[i], parent[i]);
-        // Only canonical names and the immutable lookup are needed while processing rows.
-        index.clear();
-        index.rehash(0);
-        std::vector<size_t>().swap(parent);
-        std::vector<size_t>().swap(rank);
-        std::vector<size_t>().swap(smallest);
+        std::vector<std::uint32_t> dense(names.size(), absent);
+        for (size_t i = 0; i < names.size(); ++i) {
+            const auto representative = root(static_cast<std::uint32_t>(i));
+            if (dense[representative] == absent) {
+                dense[representative] = static_cast<std::uint32_t>(canonical.size());
+                canonical.push_back(std::move(names[smallest[representative]]));
+            }
+            dense[i] = dense[representative];
+        }
+        for (auto& slot : table) if (slot.key) slot.value = dense[slot.value];
+        for (auto& item : fallback) item.second = dense[item.second];
+        std::vector<std::string>().swap(names);
+        std::vector<std::uint32_t>().swap(parent);
+        std::vector<std::uint32_t>().swap(smallest);
+        std::vector<std::uint8_t>().swap(rank);
+    }
+
+    std::uint32_t linked_person(std::string_view id, std::uint64_t encoded) const {
+        if (encoded) {
+            const auto& entry = table[position(encoded, table)];
+            return entry.key ? entry.value : absent;
+        }
+        if (fallback.empty()) return absent;
+        const auto it = fallback.find(std::string(id));
+        return it == fallback.end() ? absent : it->second;
+    }
+
+    size_t person_count() const { return canonical.size(); }
+    std::string_view canonical_name(std::uint32_t person) const { return canonical[person]; }
+
+    std::string_view person(std::string_view id) const {
+        const auto linked = linked_person(id, encode_id(id));
+        return linked == absent ? id : canonical_name(linked);
+    }
+
+private:
+    struct Slot { std::uint64_t key = 0; std::uint32_t value = 0; };
+    std::vector<Slot> table = std::vector<Slot>(16);
+    size_t used = 0;
+    std::unordered_map<std::string, std::uint32_t> fallback;
+    std::vector<std::string> names, canonical;
+    std::vector<std::uint32_t> parent, smallest;
+    std::vector<std::uint8_t> rank;
+
+    static size_t position(std::uint64_t key, const std::vector<Slot>& slots) {
+        const auto mask = slots.size() - 1;
+        auto i = id_hash({}, key) & mask;
+        while (slots[i].key && slots[i].key != key) i = (i + 1) & mask;
+        return i;
+    }
+
+    std::uint32_t add(std::string_view name) {
+        const auto node = static_cast<std::uint32_t>(names.size());
+        const auto key = encode_id(name);
+        if (key) {
+            auto i = position(key, table);
+            if (table[i].key) return table[i].value;
+            if (used >= table.size() * 2 / 3) {
+                std::vector<Slot> grown(table.size() * 2);
+                for (const auto& entry : table)
+                    if (entry.key) grown[position(entry.key, grown)] = entry;
+                table.swap(grown);
+                i = position(key, table);
+            }
+            table[i] = {key, node};
+            ++used;
+        } else {
+            auto [it, inserted] = fallback.try_emplace(std::string(name), node);
+            if (!inserted) return it->second;
+        }
+        if (node == absent) throw std::runtime_error("Too many linked IDs");
+        names.emplace_back(name);
+        parent.push_back(node);
+        smallest.push_back(node);
+        rank.push_back(0);
+        return node;
+    }
+
+    std::uint32_t root(std::uint32_t node) {
+        while (parent[node] != node) {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        return node;
     }
 };
-

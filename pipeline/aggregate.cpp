@@ -61,6 +61,7 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
     std::unordered_map<std::uint32_t, size_t> active_campaigns;
     std::optional<LatestClick> latest;
     std::string person;
+    std::uint32_t person_number = UINT32_MAX;
     bool have_person = false, have_previous = false;
     i64 previous = 0;
     Session session;
@@ -105,10 +106,11 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
     while (next(row)) {
         if (row.code < 0 || size_t(row.code) >= names.size()) throw std::runtime_error("Invalid value code");
         const i64 ts = row.ts;
-        if (!have_person || row.person != person) {
+        if (!have_person || (row.person_number == UINT32_MAX ? row.person != person : row.person_number != person_number)) {
             finish();
             flush_person();
             person = row.person;
+            person_number = row.person_number;
             have_person = true;
             have_previous = false;
             clicks.clear();

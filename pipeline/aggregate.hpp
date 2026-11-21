@@ -11,6 +11,7 @@ struct Row {
     std::string_view person, id;
     i64 ts = 0, revenue = 0;
     std::int32_t kind = 0, code = 0;
+    std::uint32_t person_number = UINT32_MAX; // External row readers supply names only.
 };
 
 using Channels = std::unordered_map<std::string, std::string>;
