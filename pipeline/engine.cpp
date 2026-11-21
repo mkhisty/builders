@@ -59,6 +59,50 @@ struct Parsed {
     i64 ingest = 0, ts = 0;
     std::uint32_t code = 0, revenue = 0;
 };
+// A leading sentinel preserves length and leading zeroes. Other IDs use full byte equality.
+std::uint64_t encode_id(std::string_view id) {
+    if (id.empty() || id.size() > 11) return 0;
+    std::uint64_t value = 1;
+    for (unsigned char c : id) {
+        unsigned digit;
+        if (c >= '0' && c <= '9') digit = c - '0' + 1;
+        else if (c >= 'a' && c <= 'z') digit = c - 'a' + 11;
+        else return 0;
+        value = value * 37 + digit;
+    }
+    return value;
+}
+
+std::uint64_t id_hash(std::string_view id, std::uint64_t encoded) {
+    if (!encoded) return std::hash<std::string_view>{}(id);
+    encoded ^= encoded >> 30;
+    encoded *= 0xbf58476d1ce4e5b9ULL;
+    encoded ^= encoded >> 27;
+    encoded *= 0x94d049bb133111ebULL;
+    return encoded ^ (encoded >> 31);
+}
+
+size_t table_capacity(size_t count) {
+    size_t capacity = 16;
+    while (count > capacity / 2) {
+        if (capacity > std::numeric_limits<size_t>::max() / 2)
+            throw std::runtime_error("ID table too large");
+        capacity *= 2;
+    }
+    return capacity;
+}
+
+struct WinnerSlot {
+    std::uint64_t encoded = 0;
+    Parsed* row = nullptr;
+};
+
+// Indices are one-based so zero marks an unused slot.
+struct PersonSlot {
+    std::uint64_t encoded = 0;
+    std::uint32_t index = 0;
+};
+
 struct CompactRow {
     i64 ts;
     std::uint32_t person, code, revenue, click;
@@ -167,16 +211,25 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
     parallel(shard_count * 2, workers, [&](size_t shard, size_t) {
         size_t count = 0;
         for (const auto& worker : parsed) count += worker[shard].size();
-        // Keys reference mapped input bytes. Equality compares full IDs after hashing.
-        std::unordered_map<std::string_view, Parsed*> winners;
-        winners.reserve(count);
+        std::vector<WinnerSlot> winners(table_capacity(count));
+        const size_t mask = winners.size() - 1;
         for (auto& worker : parsed) {
             for (auto& row : worker[shard]) {
-                auto [it, added] = winners.try_emplace(row.id, &row);
-                if (!added && row.ingest < it->second->ingest) it->second = &row;
+                const auto encoded = encode_id(row.id);
+                size_t slot = id_hash(row.id, encoded) & mask;
+                while (winners[slot].row &&
+                       (winners[slot].encoded != encoded ||
+                        (!encoded && winners[slot].row->id != row.id))) {
+                    slot = (slot + 1) & mask;
+                }
+                auto& winner = winners[slot];
+                if (!winner.row || row.ingest < winner.row->ingest)
+                    winner = {encoded, &row};
             }
         }
-        for (auto& [id, row] : winners) {
+        for (auto& winner : winners) {
+            auto* row = winner.row;
+            if (!row) continue;
             if (row->user.empty()) continue;
             row->user = ids.person(row->user);
             const size_t person_shard = std::hash<std::string_view>{}(row->user) % shard_count;
@@ -189,23 +242,43 @@ void execute(const fs::path& data, const fs::path& output, i64 start, i64 end, i
     parallel(shard_count, workers, [&](size_t shard, size_t) {
         size_t count = 0;
         for (const auto& source : buckets) count += source[shard].size();
-        std::unordered_map<std::string_view, std::uint32_t> person_codes;
-        person_codes.reserve(count / 20 + 1);
         std::vector<std::string_view> persons, click_ids;
+        std::vector<PersonSlot> person_codes(table_capacity(count / 20 + 1));
+        auto insert_person = [&](std::string_view name) {
+            const auto encoded = encode_id(name);
+            size_t slot = id_hash(name, encoded) & (person_codes.size() - 1);
+            while (person_codes[slot].index &&
+                   (person_codes[slot].encoded != encoded ||
+                    (!encoded && persons[person_codes[slot].index - 1] != name))) {
+                slot = (slot + 1) & (person_codes.size() - 1);
+            }
+            return slot;
+        };
         std::vector<CompactRow> rows;
         rows.reserve(count);
         for (auto& source : buckets) {
             for (const auto* row : source[shard]) {
                 if (persons.size() >= std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("Too many people in a shard");
-                auto [person, added] = person_codes.try_emplace(row->user, persons.size());
-                if (added) persons.push_back(row->user);
+                if (persons.size() + 1 > person_codes.size() / 2) {
+                    person_codes.assign(table_capacity(persons.size() + 1), PersonSlot{});
+                    for (size_t i = 0; i < persons.size(); ++i) {
+                        const auto slot = insert_person(persons[i]);
+                        person_codes[slot] = {encode_id(persons[i]), std::uint32_t(i + 1)};
+                    }
+                }
+                const auto slot = insert_person(row->user);
+                if (!person_codes[slot].index) {
+                    persons.push_back(row->user);
+                    person_codes[slot] = {encode_id(row->user), std::uint32_t(persons.size())};
+                }
+                const auto person = person_codes[slot].index - 1;
                 std::uint32_t click = 0;
                 if (row->code & CLICK) {
                     if (click_ids.size() >= std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("Too many clicks in a shard");
                     click_ids.push_back(row->id);
                     click = click_ids.size();
                 }
-                rows.push_back({row->ts, person->second, row->code & ~CLICK, row->revenue, click});
+                rows.push_back({row->ts, person, row->code & ~CLICK, row->revenue, click});
             }
             std::vector<Parsed*>().swap(source[shard]);
         }
