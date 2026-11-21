@@ -8,6 +8,8 @@ Completed people’s daily results and worker campaign totals are buffered into 
 
 Attribution uses a rolling seven-day click queue, the latest winning click, and active click counts per campaign. Session starts snapshot the distinct assisting campaigns. Native stage times and attribution time are logged to stderr. Run `make native && .venv/bin/python scripts/check_attribution.py` to compare rolling attribution with exhaustive click lookups.
 
+Run `make bench-parser BENCH_DATA=dev/benchmark-20m CPUS=8` to time CSV decoding and validation with the production decoder. The timer includes the checksum and excludes identity resolution, routing, aggregation, output, and setup. Set `SHOPPING_PHASE_TIMES=1` inside the pipeline process to report grouping, scatter, sort, session/assist processing, and scratch CSV output separately. These durations sum elapsed time across concurrent shards. The CSV bucket includes selecting top categories, formatting daily rows, and flushing the streams.
+
 For submission, push this repository to a public GitHub repository and provide its commit SHA to the platform. The platform builds the root Dockerfile and runs its default command. Keep generated data, output, and the virtual environment untracked; `.gitignore` excludes them. Run `make validate` successfully before submitting a solution.
 
 This repository contains a native C++ pipeline and the supplied fixture and dev-data checkers.

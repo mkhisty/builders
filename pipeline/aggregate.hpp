@@ -17,4 +17,5 @@ struct Row {
 using Channels = std::unordered_map<std::string, std::string>;
 Channels read_channels(const char* path);
 void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std::string>& names,
-                    std::uint32_t organic, const Channels& channels, const std::filesystem::path& output);
+                    std::uint32_t organic, const Channels& channels, const std::filesystem::path& output,
+                    double* scratch_seconds = nullptr);

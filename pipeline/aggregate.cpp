@@ -53,7 +53,7 @@ Channels read_channels(const char* path) {
 }
 
 void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std::string>& names,
-                    std::uint32_t organic, const Channels& channels, const fs::path& temp) {
+                    std::uint32_t organic, const Channels& channels, const fs::path& temp, double* scratch_seconds) {
     const auto began = std::chrono::steady_clock::now();
     std::map<i64, UserDaily> users;
     std::map<std::pair<std::uint32_t, i64>, CampaignDaily> campaigns;
@@ -83,11 +83,18 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
         session.active = false;
     };
 
+    using Clock = std::chrono::steady_clock;
+    auto csv_begin = scratch_seconds ? Clock::now() : Clock::time_point{};
     std::ofstream user_out(temp / "user_daily.csv", std::ios::binary);
     std::ofstream campaign_out(temp / "campaign_daily.csv", std::ios::binary);
     if (!user_out || !campaign_out) throw std::runtime_error("Cannot open aggregate output");
     user_out << "user_id,day,sessions,events,revenue_cents,top_category\n";
+    auto record_csv = [&] {
+        if (scratch_seconds) *scratch_seconds += std::chrono::duration<double>(Clock::now() - csv_begin).count();
+    };
+    record_csv();
     auto flush_person = [&] {
+        if (scratch_seconds) csv_begin = Clock::now();
         for (const auto& [key, user] : users) {
             const std::uint32_t* top = nullptr;
             i64 best = 0;
@@ -99,6 +106,7 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
             if (top) field(user_out, names[*top]);
             user_out << '\n';
         }
+        record_csv();
         users.clear();
     };
 
@@ -155,6 +163,7 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
     finish();
     flush_person();
 
+    if (scratch_seconds) csv_begin = Clock::now();
     campaign_out << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
     for (const auto& [key, campaign] : campaigns) {
         field(campaign_out, names[key.first]); campaign_out << ',';
@@ -163,6 +172,7 @@ void aggregate_rows(const std::function<bool(Row&)>& next, const std::vector<std
     }
     user_out.flush(); campaign_out.flush();
     if (!user_out || !campaign_out) throw std::runtime_error("Aggregate output write failed");
+    record_csv();
     static std::mutex timing_mutex;
     std::lock_guard<std::mutex> lock(timing_mutex);
     std::cerr << "C++ attribution: " << std::chrono::duration<double>(attribution_time).count() << " seconds\n";
